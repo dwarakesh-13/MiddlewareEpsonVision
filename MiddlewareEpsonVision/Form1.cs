@@ -1,4 +1,5 @@
-﻿using RCAPINet;
+using Newtonsoft.Json;
+using RCAPINet;
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
@@ -21,7 +22,10 @@ namespace MiddlewareEpsonVision
         private Spel m_spel;
         private TcpServer _robotServer;
         string movecommand_ToRobot;
+        private MqttHandler _mqttHandler;
 
+        /// <summary>Default MQTT topic for publishing detection/pose data.</summary>
+        public const string DefaultMqttDetectionTopic = "vision/detection/poses";
 
         public Form1()
         {
@@ -72,6 +76,10 @@ namespace MiddlewareEpsonVision
             UiLogger.Log($"Points parsed: {points.Count} Saved to: {ptsFile}");
 
             //UpdatetoRobotRC(points);
+            // Fire-and-forget so UI does not hang; MQTT has its own timeout (10 s)
+            var _ = PublishDetectionDataAsync(rawData, points);
+
+            UpdatetoRobotRC(points);
         }
 
         public List<RobotPoint> ParseRawData(string rawData)
@@ -279,10 +287,67 @@ namespace MiddlewareEpsonVision
                 UiLogger.Log($"Points parsed: {points.Count} Saved to: {ptsFile}");
 
                // UpdatetoRobotRC(points);
+                await PublishDetectionDataAsync(rawData, points);
+
+                UpdatetoRobotRC(points);
             }
             catch (Exception ex)
             {
                 MessageBox.Show("Error: " + ex.Message);
+            }
+        }
+
+        private async Task PublishDetectionDataAsync(string rawData, List<RobotPoint> points)
+        {
+            if (points == null || points.Count == 0) return;
+
+            try
+            {
+                var broker = System.Configuration.ConfigurationManager.AppSettings["MqttBroker"] ?? "localhost";
+                var portStr = System.Configuration.ConfigurationManager.AppSettings["MqttPort"] ?? "1883";
+                var mqttTopic = System.Configuration.ConfigurationManager.AppSettings["MqttDetectionTopic"] ?? DefaultMqttDetectionTopic;
+                int port = 1883;
+                int.TryParse(portStr, out port);
+
+                if (_mqttHandler == null)
+                {
+                    UiLogger.Log($"MQTT: Connecting to {broker}:{port} (timeout 10 s)...");
+                    _mqttHandler = new MqttHandler(mqttTopic);
+                    if (!await _mqttHandler.ConnectAsync(broker, port, null, null, null, false, 10000))
+                    {
+                        UiLogger.Log("MQTT: Could not connect to broker (timeout or unreachable); skipping publish.");
+                        return;
+                    }
+                    UiLogger.Log($"MQTT: Connected to {broker}:{port}");
+                }
+
+                if (!_mqttHandler.IsConnected)
+                {
+                    UiLogger.Log("MQTT: Not connected; reconnecting (timeout 10 s)...");
+                    if (!await _mqttHandler.ConnectAsync(broker, port, null, null, null, false, 10000))
+                    {
+                        UiLogger.Log("MQTT: Reconnect failed; skipping publish.");
+                        return;
+                    }
+                }
+
+                var payload = new
+                {
+                    raw = rawData,
+                    pointCount = points.Count,
+                    points = points,
+                    timestamp = DateTime.UtcNow.ToString("o")
+                };
+                var json = JsonConvert.SerializeObject(payload);
+                UiLogger.Log($"MQTT: Sending {json.Length} bytes to topic '{mqttTopic}' (QoS 1)...");
+                if (await _mqttHandler.PublishAsync(json, mqttTopic, 1, false))
+                    UiLogger.Log($"MQTT: Published {points.Count} poses to topic '{mqttTopic}'");
+                else
+                    UiLogger.Log("MQTT: Publish returned false (message may not have been sent).");
+            }
+            catch (Exception ex)
+            {
+                UiLogger.Log("MQTT: " + ex.Message);
             }
         }
 
@@ -412,6 +477,8 @@ namespace MiddlewareEpsonVision
                 WritePointsToPts(points, ptsFile);
 
                 UiLogger.Log($"Points parsed: {points.Count}");
+
+                var __ = PublishDetectionDataAsync(rawData, points);
 
                 // Robot motion happens here, sequentially
                 SendtoRobotRCMove(points, _robotServer);

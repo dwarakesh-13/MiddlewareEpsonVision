@@ -1,4 +1,4 @@
-﻿namespace MiddlewareEpsonVision
+namespace MiddlewareEpsonVision
 {
     partial class Form1
     {
